@@ -1,51 +1,166 @@
 #include <Arduino.h>
 
-// Definisikan pin ADC yang digunakan
-const int MQ7_PIN = 34;
+namespace Pin
+{
+    constexpr uint8_t MQ7 = 34; // input-only, ADC1
+    constexpr uint8_t LED_HIJAU = 27;
+    constexpr uint8_t LED_KUNING = 26;
+    constexpr uint8_t LED_MERAH = 25;
+} // namespace Pin
+
+namespace Config
+{
+    constexpr uint32_t INTERVAL_BACA_MS = 5000; // FA01
+    constexpr uint32_t WARMUP_MS = 60000;       // sementara; MQ-7 idealnya lebih lama
+    constexpr uint32_t KEDIP_MS = 500;
+    constexpr uint8_t JUMLAH_SAMPEL = 16;
+
+    // Divider: 100Ω (atas) + 220Ω (bawah). Ubah kalau resistor berbeda.
+    constexpr float RASIO_DIVIDER = (100.0f + 220.0f) / 220.0f;
+
+    // Threshold dalam mV di sisi sensor (sebelum divider). SEMENTARA, belum ppm.
+    constexpr float BATAS_WASPADA_MV = 1000.0f;
+    constexpr float BATAS_BAHAYA_MV = 2000.0f;
+    constexpr float HISTERESIS_MV = 100.0f;
+    constexpr float BATAS_ERROR_MV = 50.0f; // nyangkut ~0 V => sensor/kabel bermasalah
+} // namespace Config
+
+enum class Status
+{
+    PEMANASAN,
+    AMAN,
+    WASPADA,
+    BAHAYA,
+    SENSOR_ERROR
+};
+
+const char *namaStatus(Status s)
+{
+    switch (s)
+    {
+    case Status::PEMANASAN:
+        return "PEMANASAN";
+    case Status::AMAN:
+        return "AMAN [Udara Bersih]";
+    case Status::WASPADA:
+        return "WASPADA [Gas CO Terdeteksi!]";
+    case Status::BAHAYA:
+        return "BAHAYA [Kadar CO Tinggi!]";
+    case Status::SENSOR_ERROR:
+        return "SENSOR ERROR";
+    }
+    return "?";
+}
+
+// Rata-rata beberapa sampel untuk meredam noise ADC, lalu kembalikan ke skala sensor.
+float bacaSensorMv()
+{
+    uint32_t total = 0;
+    for (uint8_t i = 0; i < Config::JUMLAH_SAMPEL; i++)
+    {
+        total += analogReadMilliVolts(Pin::MQ7);
+        delayMicroseconds(200);
+    }
+    float mvPin = static_cast<float>(total) / Config::JUMLAH_SAMPEL;
+    return mvPin * Config::RASIO_DIVIDER;
+}
+
+// Histeresis: naik status langsung, turun status harus lewat margin.
+Status tentukanStatus(float mv, Status sebelumnya)
+{
+    if (mv < Config::BATAS_ERROR_MV)
+        return Status::SENSOR_ERROR;
+
+    const bool sedangBahaya = (sebelumnya == Status::BAHAYA);
+    const bool sedangWaspada = (sebelumnya == Status::WASPADA) || sedangBahaya;
+
+    const float batasBahaya = Config::BATAS_BAHAYA_MV - (sedangBahaya ? Config::HISTERESIS_MV : 0);
+    const float batasWaspada = Config::BATAS_WASPADA_MV - (sedangWaspada ? Config::HISTERESIS_MV : 0);
+
+    if (mv >= batasBahaya)
+        return Status::BAHAYA;
+    if (mv >= batasWaspada)
+        return Status::WASPADA;
+    return Status::AMAN;
+}
+
+void setLed(bool hijau, bool kuning, bool merah)
+{
+    digitalWrite(Pin::LED_HIJAU, hijau);
+    digitalWrite(Pin::LED_KUNING, kuning);
+    digitalWrite(Pin::LED_MERAH, merah);
+}
+
+// Dipanggil tiap loop (non-blocking) supaya kedipan tetap jalan di antara pembacaan.
+void perbaruiLed(Status s)
+{
+    static uint32_t terakhirGanti = 0;
+    static bool fase = false;
+
+    if (millis() - terakhirGanti >= Config::KEDIP_MS)
+    {
+        terakhirGanti = millis();
+        fase = !fase;
+    }
+
+    switch (s)
+    {
+    case Status::PEMANASAN:
+        setLed(fase, false, false);
+        break; // hijau berkedip
+    case Status::AMAN:
+        setLed(true, false, false);
+        break;
+    case Status::WASPADA:
+        setLed(false, true, false);
+        break;
+    case Status::BAHAYA:
+        setLed(false, false, true);
+        break;
+    case Status::SENSOR_ERROR:
+        setLed(fase, fase, fase);
+        break; // semua berkedip
+    }
+}
+
+Status statusSekarang = Status::PEMANASAN;
+uint32_t terakhirBaca = 0;
 
 void setup()
 {
-    // Inisialisasi komunikasi Serial dengan baud rate 115200
     Serial.begin(115200);
     delay(1000);
 
-    Serial.println("\n======================================");
-    Serial.println("   MONITORING SENSOR MQ-7 - ESP32     ");
-    Serial.println("======================================");
-    Serial.println("Catatan: Sensor membutuhkan pre-heating agar stabil.");
+    pinMode(Pin::LED_HIJAU, OUTPUT);
+    pinMode(Pin::LED_KUNING, OUTPUT);
+    pinMode(Pin::LED_MERAH, OUTPUT);
+    analogSetPinAttenuation(Pin::MQ7, ADC_11db); // range ~0–3.1 V
+
+    // Tes LED sekali saat boot: gampang cek wiring
+    setLed(true, true, true);
+    delay(800);
+    setLed(false, false, false);
+
+    Serial.println("\n=== MONITORING MQ-7 - ESP32 ===");
 }
 
 void loop()
 {
-    // 1. Membaca nilai analog dari pin GPIO 34 (Nilai ADC: 0 - 4095)
-    int nilaiAnalog = analogRead(MQ7_PIN);
+    const uint32_t now = millis();
 
-    // 2. Mengonversi nilai ADC ke Voltase (0V - 3.3V)
-    // Sesuai rangkaian langsung Anda saat ini
-    float voltase = (nilaiAnalog * 3.3) / 4095.0;
-
-    // 3. Menampilkan data ke Serial Monitor PlatfromIO
-    Serial.print("ADC: ");
-    Serial.print(nilaiAnalog);
-    Serial.print(" | Voltase: ");
-    Serial.print(voltase, 2); // Menampilkan 2 angka di belakang koma
-    Serial.print(" V -> ");
-
-    // 4. Logika indikator sederhana berdasarkan voltase/ADC
-    // Anda bisa mengubah angka batasan (threshold) ini nanti setelah kalibrasi
-    if (nilaiAnalog < 1200)
+    if (now < Config::WARMUP_MS)
     {
-        Serial.println("STATUS: AMAN [Udara Bersih]");
+        statusSekarang = Status::PEMANASAN;
     }
-    else if (nilaiAnalog >= 1200 && nilaiAnalog < 2500)
+    else if (now - terakhirBaca >= Config::INTERVAL_BACA_MS || terakhirBaca == 0)
     {
-        Serial.println("STATUS: WASPADA [Gas CO Terdeteksi!]");
-    }
-    else
-    {
-        Serial.println("STATUS: BAHAYA [Kadar CO Tinggi!]");
+        terakhirBaca = now;
+
+        const float mv = bacaSensorMv();
+        statusSekarang = tentukanStatus(mv, statusSekarang);
+
+        Serial.printf("Sensor: %.0f mV | STATUS: %s\n", mv, namaStatus(statusSekarang));
     }
 
-    // Tunggu 1,5 detik sebelum pembacaan berikutnya
-    delay(1500);
+    perbaruiLed(statusSekarang);
 }
